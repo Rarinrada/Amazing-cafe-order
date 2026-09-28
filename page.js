@@ -1,271 +1,373 @@
 'use client';
 
-import { useState } from 'react';
-import { supabase } from '../../lib/supabaseClient';
+import { use, useEffect, useState } from 'react';
+import { supabase } from '../../../lib/supabaseClient';
 
-export default function GenerateQrPage() {
-  const [tableNumber, setTableNumber] = useState('');
-  const [adultCount, setAdultCount] = useState('');
-  const [childCount, setChildCount] = useState('');
+const ADULT_PRICE = 289;
+const CHILD_PRICE = 145;
+const MAX_QTY = 5; // จำนวนสูงสุดต่อเมนู
+const MAX_LINES = 10; // จำนวนรายการเมนูสูงสุดต่อการส่ง 1 ครั้ง
 
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+export default function OrderPage({ params }) {
+  // Next.js เวอร์ชันล่าสุด: params เป็น Promise ต้อง unwrap ด้วย use()
+  const { tableNumber } = use(params);
+  const table = Number(tableNumber);
 
-  // session เก่าที่ยังเปิดค้างอยู่ (ถ้ามี)
-  const [existing, setExisting] = useState(null);
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [confirmNow, setConfirmNow] = useState(0);
-  const [closing, setClosing] = useState(false);
+  // loading | unavailable | ready | thanks | error
+  const [status, setStatus] = useState('loading');
+  const [errorMsg, setErrorMsg] = useState('');
 
-  // ผลลัพธ์หลังสร้าง session ใหม่สำเร็จ
-  const [result, setResult] = useState(null);
-  const [copied, setCopied] = useState(false);
+  const [session, setSession] = useState(null);
+  const [categories, setCategories] = useState([]);
+  const [items, setItems] = useState([]);
+  const [activeCat, setActiveCat] = useState(null);
 
-  function resetAll() {
-    setTableNumber('');
-    setAdultCount('');
-    setChildCount('');
-    setError('');
-    setExisting(null);
-    setConfirmOpen(false);
-    setResult(null);
-    setCopied(false);
+  // cart: { [itemId]: { name, quantity } }
+  const [cart, setCart] = useState({});
+  const [cartOpen, setCartOpen] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [notice, setNotice] = useState('');
+
+  const [billOpen, setBillOpen] = useState(false);
+  const [billing, setBilling] = useState(false);
+
+  // ---------- โหลด session + เมนู ----------
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      if (!Number.isInteger(table) || table <= 0) {
+        setStatus('unavailable');
+        return;
+      }
+      try {
+        const { data: sessionRows, error: sErr } = await supabase
+          .from('sessions')
+          .select('id, table_number, adult_count, child_count, status')
+          .eq('table_number', table)
+          .eq('status', 'open')
+          .order('created_at', { ascending: false })
+          .limit(1);
+        if (sErr) throw sErr;
+        if (cancelled) return;
+
+        if (!sessionRows || sessionRows.length === 0) {
+          setStatus('unavailable');
+          return;
+        }
+        setSession(sessionRows[0]);
+
+        const [catRes, itemRes] = await Promise.all([
+          supabase.from('menu_categories').select('id, name, sort_order').order('sort_order', { ascending: true }),
+          supabase.from('menu_items').select('id, category_id, name').order('id', { ascending: true }),
+        ]);
+        if (catRes.error) throw catRes.error;
+        if (itemRes.error) throw itemRes.error;
+        if (cancelled) return;
+
+        setCategories(catRes.data || []);
+        setItems(itemRes.data || []);
+        setActiveCat(catRes.data && catRes.data.length > 0 ? catRes.data[0].id : null);
+        setStatus('ready');
+      } catch (e) {
+        if (cancelled) return;
+        setErrorMsg(e?.message || 'ไม่ทราบสาเหตุ');
+        setStatus('error');
+      }
+    }
+
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [table]);
+
+  // ข้อความแจ้งเตือนสั้น ๆ หายเองใน 3 วินาที
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(''), 3000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
+  // ---------- ตะกร้า ----------
+  const lines = Object.entries(cart);
+  const lineCount = lines.length;
+  const totalQty = lines.reduce((sum, [, v]) => sum + v.quantity, 0);
+
+  function addItem(item) {
+    const existing = cart[item.id];
+    if (existing) {
+      if (existing.quantity >= MAX_QTY) {
+        setNotice(`สั่งได้สูงสุด ${MAX_QTY} ที่ต่อเมนู`);
+        return;
+      }
+      setCart({ ...cart, [item.id]: { ...existing, quantity: existing.quantity + 1 } });
+      return;
+    }
+    if (lineCount >= MAX_LINES) {
+      setNotice(`ส่งได้สูงสุด ${MAX_LINES} รายการต่อครั้ง กรุณาส่งออเดอร์ก่อนแล้วสั่งเพิ่ม`);
+      return;
+    }
+    setCart({ ...cart, [item.id]: { name: item.name, quantity: 1 } });
   }
 
-  async function handleOpenTable() {
-    setError('');
-    const table = Number(tableNumber);
-    const adults = Number(adultCount || 0);
-    const children = Number(childCount || 0);
+  function decreaseItem(itemId) {
+    const existing = cart[itemId];
+    if (!existing) return;
+    if (existing.quantity <= 1) {
+      const next = { ...cart };
+      delete next[itemId];
+      setCart(next);
+      if (Object.keys(next).length === 0) setCartOpen(false);
+    } else {
+      setCart({ ...cart, [itemId]: { ...existing, quantity: existing.quantity - 1 } });
+    }
+  }
 
-    if (!Number.isInteger(table) || table <= 0) {
-      setError('กรุณากรอกเลขโต๊ะเป็นตัวเลขที่ถูกต้อง');
-      return;
-    }
-    if (!Number.isInteger(adults) || adults < 0 || !Number.isInteger(children) || children < 0) {
-      setError('จำนวนผู้ใหญ่/เด็ก ต้องเป็นตัวเลข 0 ขึ้นไป');
-      return;
-    }
-    if (adults + children === 0) {
-      setError('กรุณากรอกจำนวนลูกค้าอย่างน้อย 1 คน');
-      return;
-    }
-
-    setLoading(true);
+  // ---------- ส่งออเดอร์ ----------
+  async function sendOrder() {
+    if (sending || lineCount === 0 || !session) return;
+    setSending(true);
     try {
-      // 1) เช็คว่ามี session เปิดค้างของโต๊ะนี้อยู่หรือไม่
-      const { data: openRows, error: checkError } = await supabase
+      // เช็คซ้ำว่า session ยังเปิดอยู่
+      const { data: stillOpen, error: checkErr } = await supabase
         .from('sessions')
-        .select('id, table_number, adult_count, child_count, created_at')
-        .eq('table_number', table)
+        .select('id')
+        .eq('id', session.id)
         .eq('status', 'open')
-        .order('created_at', { ascending: false })
         .limit(1);
-
-      if (checkError) throw checkError;
-
-      if (openRows && openRows.length > 0) {
-        setExisting(openRows[0]);
+      if (checkErr) throw checkErr;
+      if (!stillOpen || stillOpen.length === 0) {
+        setStatus('unavailable');
         return;
       }
 
-      // 2) ไม่มี -> สร้าง session ใหม่
-      const { data: created, error: insertError } = await supabase
-        .from('sessions')
-        .insert({
-          table_number: table,
-          adult_count: adults,
-          child_count: children,
-          status: 'open',
-        })
-        .select('id, table_number, adult_count, child_count')
-        .single();
+      const orderItems = lines.map(([, v]) => ({ name: v.name, quantity: v.quantity }));
+      const { error: insErr } = await supabase.from('orders').insert({
+        session_id: session.id,
+        table_number: table,
+        items: orderItems,
+        status: 'received',
+      });
+      if (insErr) throw insErr;
 
-      if (insertError) throw insertError;
-
-      const url = `${window.location.origin}/order/${created.table_number}`;
-      setResult({ ...created, url });
-      setCopied(false);
+      setCart({});
+      setCartOpen(false);
+      setNotice('ส่งออเดอร์แล้ว');
     } catch (e) {
-      setError('เกิดข้อผิดพลาด: ' + (e?.message || 'ไม่ทราบสาเหตุ'));
+      setNotice('ส่งออเดอร์ไม่สำเร็จ: ' + (e?.message || 'กรุณาลองใหม่'));
     } finally {
-      setLoading(false);
+      setSending(false);
     }
   }
 
-  function openConfirm() {
-    setConfirmNow(Date.now());
-    setConfirmOpen(true);
-  }
+  // ---------- เรียกเก็บเงิน ----------
+  const adultCount = Number(session?.adult_count || 0);
+  const childCount = Number(session?.child_count || 0);
+  const adultTotal = adultCount * ADULT_PRICE;
+  const childTotal = childCount * CHILD_PRICE;
+  const grandTotal = adultTotal + childTotal;
 
-  async function handleConfirmClose() {
-    if (!existing) return;
-    setClosing(true);
-    setError('');
+  async function confirmBill() {
+    if (billing || !session) return;
+    setBilling(true);
     try {
-      // อัปเดตเฉพาะแถวนี้ และเฉพาะที่ยังเป็น 'open' (กันกดซ้ำซ้อน)
-      const { error: updateError } = await supabase
+      const { error: upErr } = await supabase
         .from('sessions')
         .update({ status: 'closed' })
-        .eq('id', existing.id)
+        .eq('id', session.id)
         .eq('status', 'open')
         .select('id');
+      if (upErr) throw upErr;
 
-      if (updateError) throw updateError;
-
-      // ปิดกล่องยืนยัน + เอากล่องเตือนออก กลับไปที่ฟอร์ม (ค่าที่กรอกยังอยู่)
-      setConfirmOpen(false);
-      setExisting(null);
+      setBillOpen(false);
+      setCartOpen(false);
+      setStatus('thanks');
     } catch (e) {
-      setError('ปิดโต๊ะเดิมไม่สำเร็จ: ' + (e?.message || 'ไม่ทราบสาเหตุ'));
-      setConfirmOpen(false);
+      setBillOpen(false);
+      setNotice('เรียกเก็บเงินไม่สำเร็จ: ' + (e?.message || 'กรุณาลองใหม่'));
     } finally {
-      setClosing(false);
+      setBilling(false);
     }
   }
 
-  async function handleCopy() {
-    if (!result) return;
-    try {
-      await navigator.clipboard.writeText(result.url);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      setError('คัดลอกไม่สำเร็จ กรุณาคัดลอกลิงก์ด้วยตัวเอง');
-    }
+  // ---------- หน้าเต็มจอตามสถานะ ----------
+  if (status === 'loading') {
+    return <FullScreen text="กำลังโหลด..." />;
+  }
+  if (status === 'unavailable') {
+    return <FullScreen text="โต๊ะนี้ยังไม่เปิดใช้งาน กรุณาแจ้งพนักงาน" />;
+  }
+  if (status === 'thanks') {
+    return <FullScreen text="ขอบคุณที่ใช้บริการ" emoji="🙏" />;
+  }
+  if (status === 'error') {
+    return <FullScreen text={`โหลดข้อมูลไม่สำเร็จ: ${errorMsg}`} />;
   }
 
-  const minutesOpen = existing
-    ? Math.max(0, Math.floor((confirmNow - new Date(existing.created_at).getTime()) / 60000))
-    : 0;
+  // ---------- หน้าสั่งอาหาร ----------
+  const visibleItems = items.filter((it) => it.category_id === activeCat);
 
-  // ---------- หน้าผลลัพธ์ QR ----------
-  if (result) {
-    const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(result.url)}`;
-    return (
-      <main style={s.main}>
-        <h1 style={s.h1}>เปิดโต๊ะสำเร็จ</h1>
-        <div style={{ ...s.card, textAlign: 'center' }}>
-          <img src={qrSrc} alt={`QR โต๊ะ ${result.table_number}`} width={300} height={300} style={{ maxWidth: '100%', height: 'auto' }} />
-          <p style={s.summary}>
-            โต๊ะ {result.table_number} · ผู้ใหญ่ {result.adult_count} · เด็ก {result.child_count}
-          </p>
-          <div style={s.linkRow}>
-            <span style={s.linkText}>{result.url}</span>
-            <button onClick={handleCopy} style={s.smallBtn}>
-              {copied ? 'คัดลอกแล้ว ✓' : 'คัดลอกลิงก์'}
+  return (
+    <div style={s.page}>
+      <header style={s.header}>
+        <div>
+          <div style={s.brand}>Amazing cafe</div>
+          <div style={s.tableLabel}>โต๊ะ {table}</div>
+        </div>
+        <button onClick={() => setBillOpen(true)} style={s.billBtn}>
+          เรียกเก็บเงิน
+        </button>
+      </header>
+
+      <nav style={s.tabs}>
+        {categories.map((c) => (
+          <button
+            key={c.id}
+            onClick={() => setActiveCat(c.id)}
+            style={{ ...s.tab, ...(c.id === activeCat ? s.tabActive : {}) }}
+          >
+            {c.name}
+          </button>
+        ))}
+      </nav>
+
+      <main style={s.list}>
+        {visibleItems.length === 0 && <p style={s.empty}>ยังไม่มีเมนูในหมวดนี้</p>}
+        {visibleItems.map((it) => {
+          const inCart = cart[it.id];
+          return (
+            <div key={it.id} style={s.itemRow}>
+              <span style={s.itemName}>{it.name}</span>
+              {inCart ? (
+                <div style={s.stepper}>
+                  <button onClick={() => decreaseItem(it.id)} style={s.stepBtn} aria-label="ลด">
+                    −
+                  </button>
+                  <span style={s.qty}>{inCart.quantity}</span>
+                  <button onClick={() => addItem(it)} style={s.stepBtn} aria-label="เพิ่ม">
+                    +
+                  </button>
+                </div>
+              ) : (
+                <button onClick={() => addItem(it)} style={s.addBtn} aria-label={`เพิ่ม ${it.name}`}>
+                  +
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </main>
+
+      {notice && <div style={s.toast}>{notice}</div>}
+
+      {/* ตะกร้าลอยด้านล่าง */}
+      {lineCount > 0 && !cartOpen && (
+        <button onClick={() => setCartOpen(true)} style={s.cartBar}>
+          <span>🛒 ตะกร้า · {lineCount} รายการ ({totalQty} ที่)</span>
+          <span>ดูตะกร้า ›</span>
+        </button>
+      )}
+
+      {cartOpen && (
+        <div style={s.sheetOverlay} onClick={() => setCartOpen(false)}>
+          <div style={s.sheet} onClick={(e) => e.stopPropagation()}>
+            <div style={s.sheetTitle}>
+              ตะกร้า ({lineCount}/{MAX_LINES} รายการ)
+            </div>
+            <div style={{ overflowY: 'auto', flex: 1 }}>
+              {lines.map(([id, v]) => (
+                <div key={id} style={s.itemRow}>
+                  <span style={s.itemName}>{v.name}</span>
+                  <div style={s.stepper}>
+                    <button onClick={() => decreaseItem(id)} style={s.stepBtn} aria-label="ลด">
+                      −
+                    </button>
+                    <span style={s.qty}>{v.quantity}</span>
+                    <button onClick={() => addItem({ id, name: v.name })} style={s.stepBtn} aria-label="เพิ่ม">
+                      +
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <button onClick={sendOrder} disabled={sending} style={{ ...s.sendBtn, opacity: sending ? 0.6 : 1 }}>
+              {sending ? 'กำลังส่ง...' : 'ส่งออเดอร์'}
+            </button>
+            <button onClick={() => setCartOpen(false)} style={s.closeSheetBtn}>
+              สั่งเมนูเพิ่ม
             </button>
           </div>
-          {error && <p style={s.errorText}>{error}</p>}
-          <button onClick={resetAll} style={{ ...s.primaryBtn, marginTop: 20 }}>
-            เปิดโต๊ะใหม่
-          </button>
-        </div>
-      </main>
-    );
-  }
-
-  // ---------- หน้าฟอร์ม ----------
-  return (
-    <main style={s.main}>
-      <h1 style={s.h1}>เปิดโต๊ะ</h1>
-
-      {existing && (
-        <div style={s.warnBox} role="alert">
-          <p style={s.warnText}>โต๊ะนี้มีลูกค้าอยู่ระหว่างทานอาหาร กรุณาปิดออเดอร์เดิมก่อน</p>
-          <button onClick={openConfirm} style={s.warnBtn}>
-            ปิดออเดอร์เดิม
-          </button>
         </div>
       )}
 
-      <div style={s.card}>
-        <label style={s.label}>
-          เลขโต๊ะ
-          <input
-            type="number"
-            inputMode="numeric"
-            min="1"
-            value={tableNumber}
-            onChange={(e) => {
-              setTableNumber(e.target.value);
-              setExisting(null); // เปลี่ยนโต๊ะ -> กล่องเตือนของโต๊ะเดิมไม่เกี่ยวแล้ว
-            }}
-            style={s.input}
-          />
-        </label>
-        <label style={s.label}>
-          จำนวนผู้ใหญ่
-          <input
-            type="number"
-            inputMode="numeric"
-            min="0"
-            value={adultCount}
-            onChange={(e) => setAdultCount(e.target.value)}
-            style={s.input}
-          />
-        </label>
-        <label style={s.label}>
-          จำนวนเด็ก
-          <input
-            type="number"
-            inputMode="numeric"
-            min="0"
-            value={childCount}
-            onChange={(e) => setChildCount(e.target.value)}
-            style={s.input}
-          />
-        </label>
-
-        {error && <p style={s.errorText}>{error}</p>}
-
-        <button onClick={handleOpenTable} disabled={loading} style={{ ...s.primaryBtn, opacity: loading ? 0.6 : 1 }}>
-          {loading ? 'กำลังตรวจสอบ...' : 'เปิดโต๊ะ'}
-        </button>
-      </div>
-
-      {confirmOpen && existing && (
-        <div style={s.overlay}>
-          <div style={s.dialog} role="dialog" aria-modal="true">
-            <h2 style={{ fontSize: 26, margin: '0 0 12px', color: '#b91c1c' }}>ยืนยันปิดโต๊ะเดิม</h2>
-            <p style={s.dialogLine}>โต๊ะ {existing.table_number}</p>
-            <p style={s.dialogLine}>
-              ผู้ใหญ่ {existing.adult_count} · เด็ก {existing.child_count}
+      {billOpen && (
+        <div style={s.modalOverlay}>
+          <div style={s.modal} role="dialog" aria-modal="true">
+            <h2 style={{ fontSize: 26, margin: '0 0 12px' }}>ยืนยันเรียกเก็บเงิน</h2>
+            <p style={s.billLine}>
+              ผู้ใหญ่ {adultCount} × {ADULT_PRICE} = {adultTotal.toLocaleString()} บาท
             </p>
-            <p style={s.dialogLine}>เปิดมาแล้ว {minutesOpen} นาที</p>
+            <p style={s.billLine}>
+              เด็ก {childCount} × {CHILD_PRICE} = {childTotal.toLocaleString()} บาท
+            </p>
+            <p style={s.billTotal}>รวม {grandTotal.toLocaleString()} บาท</p>
+            <p style={{ fontSize: 16, color: '#7a6a55', margin: '4px 0 0' }}>
+              เมื่อยืนยันแล้วจะสั่งอาหารเพิ่มไม่ได้
+            </p>
             <div style={{ display: 'flex', gap: 12, marginTop: 20 }}>
-              <button onClick={() => setConfirmOpen(false)} disabled={closing} style={s.cancelBtn}>
+              <button onClick={() => setBillOpen(false)} disabled={billing} style={s.cancelBtn}>
                 ยกเลิก
               </button>
-              <button onClick={handleConfirmClose} disabled={closing} style={{ ...s.dangerBtn, opacity: closing ? 0.6 : 1 }}>
-                {closing ? 'กำลังปิด...' : 'ยืนยันปิดโต๊ะเดิม'}
+              <button onClick={confirmBill} disabled={billing} style={{ ...s.confirmBtn, opacity: billing ? 0.6 : 1 }}>
+                {billing ? 'กำลังดำเนินการ...' : 'ยืนยัน'}
               </button>
             </div>
           </div>
         </div>
       )}
-    </main>
+    </div>
+  );
+}
+
+function FullScreen({ text, emoji }) {
+  return (
+    <div style={s.full}>
+      {emoji && <div style={{ fontSize: 64, marginBottom: 12 }}>{emoji}</div>}
+      <p style={{ fontSize: 28, fontWeight: 700, margin: 0, lineHeight: 1.4 }}>{text}</p>
+    </div>
   );
 }
 
 const s = {
-  main: { maxWidth: 480, margin: '0 auto', padding: 20, fontFamily: 'sans-serif', fontSize: 20 },
-  h1: { fontSize: 32, margin: '0 0 16px' },
-  card: { background: '#fff', border: '1px solid #ddd', borderRadius: 12, padding: 20, display: 'flex', flexDirection: 'column', gap: 16 },
-  label: { display: 'flex', flexDirection: 'column', gap: 6, fontSize: 22, fontWeight: 600 },
-  input: { fontSize: 28, padding: '12px 14px', border: '2px solid #999', borderRadius: 8 },
-  primaryBtn: { fontSize: 26, fontWeight: 700, padding: '16px', background: '#166534', color: '#fff', border: 'none', borderRadius: 10, cursor: 'pointer' },
-  errorText: { color: '#b91c1c', fontSize: 20, margin: 0 },
-  warnBox: { background: '#fff7ed', border: '3px solid #ea580c', borderRadius: 12, padding: 18, marginBottom: 16, display: 'flex', flexDirection: 'column', gap: 12 },
-  warnText: { margin: 0, fontSize: 24, fontWeight: 700, color: '#9a3412' },
-  warnBtn: { fontSize: 24, fontWeight: 700, padding: '14px', background: '#ea580c', color: '#fff', border: 'none', borderRadius: 10, cursor: 'pointer' },
-  overlay: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, zIndex: 50 },
-  dialog: { background: '#fff', border: '4px solid #dc2626', borderRadius: 14, padding: 24, width: '100%', maxWidth: 420 },
-  dialogLine: { fontSize: 24, margin: '6px 0' },
-  cancelBtn: { flex: 1, fontSize: 22, fontWeight: 700, padding: '14px', background: '#e5e7eb', color: '#111', border: 'none', borderRadius: 10, cursor: 'pointer' },
-  dangerBtn: { flex: 1, fontSize: 22, fontWeight: 700, padding: '14px', background: '#dc2626', color: '#fff', border: 'none', borderRadius: 10, cursor: 'pointer' },
-  summary: { fontSize: 28, fontWeight: 700, margin: '8px 0 0' },
-  linkRow: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', justifyContent: 'center' },
-  linkText: { fontSize: 18, wordBreak: 'break-all' },
-  smallBtn: { fontSize: 16, padding: '8px 12px', background: '#e5e7eb', border: '1px solid #999', borderRadius: 8, cursor: 'pointer' },
+  page: { minHeight: '100vh', background: '#fbf6ec', color: '#3b2f22', fontFamily: 'sans-serif', paddingBottom: 110 },
+  header: { position: 'sticky', top: 0, zIndex: 20, background: '#3b2f22', color: '#fbf6ec', padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+  brand: { fontSize: 20, fontWeight: 700 },
+  tableLabel: { fontSize: 16, opacity: 0.85 },
+  billBtn: { fontSize: 16, fontWeight: 700, padding: '10px 14px', background: '#f5c26b', color: '#3b2f22', border: 'none', borderRadius: 10, cursor: 'pointer' },
+  tabs: { position: 'sticky', top: 62, zIndex: 15, display: 'flex', gap: 8, overflowX: 'auto', padding: '10px 12px', background: '#fbf6ec', borderBottom: '1px solid #e6dcc6' },
+  tab: { flex: '0 0 auto', fontSize: 18, fontWeight: 600, padding: '10px 18px', borderRadius: 999, border: '2px solid #c9b68f', background: '#fff', color: '#3b2f22', cursor: 'pointer' },
+  tabActive: { background: '#b4532a', color: '#fff', borderColor: '#b4532a' },
+  list: { padding: '8px 16px' },
+  empty: { textAlign: 'center', fontSize: 18, color: '#7a6a55', marginTop: 40 },
+  itemRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '14px 0', borderBottom: '1px dashed #d9ccb0' },
+  itemName: { fontSize: 20, flex: 1 },
+  addBtn: { width: 52, height: 52, fontSize: 30, fontWeight: 700, lineHeight: 1, borderRadius: '50%', border: 'none', background: '#b4532a', color: '#fff', cursor: 'pointer' },
+  stepper: { display: 'flex', alignItems: 'center', gap: 10 },
+  stepBtn: { width: 48, height: 48, fontSize: 26, fontWeight: 700, lineHeight: 1, borderRadius: '50%', border: '2px solid #b4532a', background: '#fff', color: '#b4532a', cursor: 'pointer' },
+  qty: { minWidth: 24, textAlign: 'center', fontSize: 22, fontWeight: 700 },
+  toast: { position: 'fixed', left: 16, right: 16, bottom: 96, zIndex: 40, background: '#166534', color: '#fff', textAlign: 'center', fontSize: 20, fontWeight: 700, padding: '14px 16px', borderRadius: 12, boxShadow: '0 4px 14px rgba(0,0,0,0.25)' },
+  cartBar: { position: 'fixed', left: 12, right: 12, bottom: 16, zIndex: 30, display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 20, fontWeight: 700, padding: '18px 20px', background: '#b4532a', color: '#fff', border: 'none', borderRadius: 16, boxShadow: '0 4px 14px rgba(0,0,0,0.3)', cursor: 'pointer' },
+  sheetOverlay: { position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'flex-end' },
+  sheet: { width: '100%', maxHeight: '80vh', display: 'flex', flexDirection: 'column', background: '#fbf6ec', borderRadius: '20px 20px 0 0', padding: '18px 16px 20px' },
+  sheetTitle: { fontSize: 24, fontWeight: 700, marginBottom: 6 },
+  sendBtn: { marginTop: 14, fontSize: 24, fontWeight: 700, padding: '18px', background: '#166534', color: '#fff', border: 'none', borderRadius: 14, cursor: 'pointer' },
+  closeSheetBtn: { marginTop: 10, fontSize: 18, fontWeight: 600, padding: '12px', background: 'transparent', color: '#7a6a55', border: 'none', cursor: 'pointer' },
+  modalOverlay: { position: 'fixed', inset: 0, zIndex: 60, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
+  modal: { width: '100%', maxWidth: 400, background: '#fff', borderRadius: 16, padding: 24 },
+  billLine: { fontSize: 20, margin: '6px 0' },
+  billTotal: { fontSize: 30, fontWeight: 800, margin: '14px 0 0', color: '#b4532a' },
+  cancelBtn: { flex: 1, fontSize: 20, fontWeight: 700, padding: '14px', background: '#e5e7eb', color: '#111', border: 'none', borderRadius: 10, cursor: 'pointer' },
+  confirmBtn: { flex: 1, fontSize: 20, fontWeight: 700, padding: '14px', background: '#b4532a', color: '#fff', border: 'none', borderRadius: 10, cursor: 'pointer' },
+  full: { minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', textAlign: 'center', padding: 24, background: '#fbf6ec', color: '#3b2f22', fontFamily: 'sans-serif' },
 };
